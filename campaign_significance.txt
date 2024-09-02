@@ -1,0 +1,322 @@
+create or replace table chadg.campaign_clear_your_balance_customers as
+select
+    adobe_campaign_no,
+    dm_no,
+    tcustomer_id,
+    id_code,
+    target,
+    holdout
+from
+    `dna-data-prod-campaign.feature_store.campaign_data_adobe_history`      --Must change
+where (adobe_campaign_no = 'OP4192')
+;
+
+
+-----------------------------
+------- Transactions --------
+-----------------------------
+create or replace table chadg.campaign_transactions as
+select
+    a.customer_guid,
+    trn_date,
+    guid,
+    trn_sale_amt,
+    
+    b.adobe_campaign_no,
+    b.dm_no,
+    target,
+    case holdout
+        when 1 then 'Holdout'
+        else 'Target'
+    end as holdout,
+    
+    case
+        when trn_date >= '2020-09-03' and trn_date <= '2020-10-01' then 'Experiment'        -- Experiment takes place between 3 Sep and 1 Oct
+        else 'Control'                                                                      -- Control is between 1 Aug until 2 Sep
+    end as control_experiment,
+    
+    no_of_targets,
+    no_of_holdouts,
+    c.campaign_date
+from
+    (select
+        customer_guid,
+        guid,
+        trn_date,
+        sum(trn_sale_amt) trn_sale_amt
+    from
+        (select
+            customer_guid,
+            guid,
+            trn_date,
+            trn_sale_amt
+        from
+            `dna-data-prod.prepared_vw.ackermans_customer_basket_laybye_vw`
+        where trn_date >= '2020-08-01'
+        and trn_date <= '2020-10-01'
+
+        union all
+
+        select
+            customer_guid,
+            guid,
+            trn_date,
+            trn_sale_amt
+        from
+            `dna-data-prod.prepared_vw.ackermans_customer_basket_store_card_vw`
+        where trn_date >= '2020-08-01'
+        and trn_date <= '2020-10-01'
+        )
+    group by customer_guid,guid,trn_date
+    ) a
+    
+inner join
+    chadg.campaign_clear_your_balance_customers b
+on a.customer_guid = b.customer_guid
+
+left join
+    (select
+        *
+    from
+        `grp-products-cms-prod.feature_store.campaign_info_adobe_history`
+    where adobe_campaign_no in ('OP4192','OP4193')
+    ) c
+on b.adobe_campaign_no = c.adobe_campaign_no
+and c.dm_no = b.dm_no
+;
+
+
+------------------------------
+--------- Base Data ----------
+------------------------------
+create or replace table chadg.campaign_signi_base as
+select
+    adobe_campaign_no,
+    trn_date,
+    holdout,
+    a.customer_guid,
+    guid,
+    control_experiment,
+    trn_value
+from
+    (select distinct
+        customer_guid
+    from
+        chadg.campaign_transactions
+    where control_experiment = 'Experiment'
+    and trn_sale_amt > 0
+    ) a
+inner join                                                    -- Only want customers who purchased in control period and in experiment period
+    (select distinct
+        customer_guid
+    from
+        chadg.campaign_transactions
+    where control_experiment = 'Control'
+    and trn_sale_amt > 0
+    ) b
+on a.customer_guid = b.customer_guid
+
+left join
+    (select
+        adobe_campaign_no,
+        trn_date,
+        holdout,
+        customer_guid,
+        guid,
+        control_experiment,
+        sum(trn_sale_amt) trn_value
+    from
+        chadg.campaign_transactions
+     where trn_sale_amt > 0
+     group by adobe_campaign_no,trn_date,holdout,customer_guid,guid,control_experiment
+    ) c
+on a.customer_guid = c.customer_guid
+where c.trn_value > 50
+;
+
+
+-----------------------------------
+------ Build Person features ------
+-----------------------------------
+create or replace table chadg.campaign_signi_cust_no as
+select
+    holdout,
+    count(distinct customer_guid) no_of_customers
+from
+    chadg.campaign_signi_base
+group by holdout
+;
+
+
+-----------------------------------
+------ Build Person features ------
+-----------------------------------
+create or replace table chadg.campaign_signi_person_base as
+select
+    customer_guid,
+    control_experiment,
+    holdout,
+    count(distinct guid) trn_frequency,
+    avg(trn_value) avg_trn_value,
+    sum(trn_value) spending_value
+from
+    chadg.campaign_signi_base
+group by id_code,control_experiment,holdout
+;
+
+
+create or replace table chadg.campaign_signi_person as
+select
+    a.customer_guid,
+    a.holdout,
+    
+    a.trn_frequency control_trn_frequency,
+    b.trn_frequency  experiment_trn_frequency,
+    
+    a.avg_trn_value control_avg_trn_value,
+    b.avg_trn_value  experiment_avg_trn_value,
+    
+    a.spending_value control_spending_value,
+    b.spending_value experiment_spending_value
+from
+    (select
+        customer_guid,
+        holdout,
+        trn_frequency,
+        avg_trn_value,
+        spending_value
+    from
+        chadg.campaign_signi_person_base
+    where control_experiment = 'Control'
+    ) a
+left join
+    (select
+        customer_guid,
+        holdout,
+        trn_frequency,
+        avg_trn_value,
+        spending_value
+    from
+        chadg.campaign_signi_person_base
+    where control_experiment = 'Experiment'
+    ) b
+on a.customer_guid = b.customer_guid
+and a.holdout = b.holdout
+
+where b.trn_frequency is not NULL
+;
+
+
+-----------------------------------
+------ Build Daily features -------
+-----------------------------------
+create or replace table chadg.campaign_signi_daily_base as
+select
+    trn_date,
+    control_experiment,
+    a.holdout,
+    round((a.no_of_customers / b.no_of_customers) * c.max_cust) no_of_cust,
+    round((trn_frequency / b.no_of_customers) * c.max_cust) trn_frequency,
+    round((spending_value / b.no_of_customers) * c.max_cust) spending_value,
+    avg_trn_value
+from
+    (select
+        trn_date,
+        control_experiment,
+        holdout,
+        count(distinct customer_guid) no_of_customers,
+        count(distinct guid) trn_frequency,
+        sum(trn_value) spending_value,
+        avg(trn_value) avg_trn_value
+    from
+        chadg.campaign_signi_base
+    group by trn_date,control_experiment,holdout
+    ) a
+left join
+    chadg.campaign_signi_cust_no b
+on a.holdout = b.holdout
+cross join
+    (select max(no_of_customers) max_cust from chadg.campaign_signi_cust_no) c
+order by trn_date
+;
+
+
+create or replace table chadg.campaign_signi_daily as
+select
+    a.trn_date,
+    a.control_experiment,
+    
+    a.no_of_cust - b.no_of_cust no_of_cust_diff,
+    a.trn_frequency - b.trn_frequency trn_frequency_diff,
+    a.spending_value - b.spending_value spending_value_diff,
+    a.avg_trn_value - b.avg_trn_value avg_trn_value_diff,
+    
+    'Campaign Sales' campaign_sales,
+    (d.exp_avg_trn_value - c.cont_avg_trn_value) * d.exp_total_no_of_trn campaign_sales_value,
+    255223 as campaign_costs
+from
+    (select
+        trn_date,
+        control_experiment,
+        no_of_cust,
+        trn_frequency,
+        spending_value,
+        avg_trn_value
+    from
+        chadg.campaign_signi_daily_base
+    where holdout = 'Target'
+    ) a
+left join
+    (select
+        trn_date,
+        control_experiment,
+        no_of_cust,
+        trn_frequency,
+        spending_value,
+        avg_trn_value
+    from
+        chadg.campaign_signi_daily_base
+    where holdout = 'Holdout'
+    ) b
+on a.trn_date = b.trn_date
+and a.control_experiment = b.control_experiment
+
+cross join
+    (select
+        sum(trn_sale_amt) / count(distinct guid) cont_avg_trn_value
+    from
+        chadg.campaign_transactions
+    where control_experiment = 'Control'
+    ) c
+    
+cross join
+    (select
+        count(distinct guid) exp_total_no_of_trn,
+        sum(trn_sale_amt) / count(distinct guid) exp_avg_trn_value
+    from
+        chadg.campaign_transactions
+    where control_experiment = 'Experiment'
+    ) d
+ 
+order by a.trn_date,a.control_experiment
+; 
+
+
+------------------------------------
+--------- SMS SIGNIFICANCE ---------
+------------------------------------
+create or replace table chadg.campaign_signi_sms as
+select
+    trn_date,
+    control_experiment,
+    holdout,
+    trn_frequency,
+    avg_trn_value,
+    spending_value,
+    no_of_cust
+from
+    chadg.campaign_signi_daily_base
+where trn_date > '2020-09-12'
+and trn_date <= '2020-09-22'
+order by trn_date
+;
